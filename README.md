@@ -61,6 +61,23 @@ python src/main.py --mode video --input input/videos/cctv_test.mp4
 python src/main.py --mode image --input input/images/test_01.jpg --threshold 0.30
 ```
 
+## Video-mode output
+
+Video scanning runs quietly behind a progress bar. At the end it prints the
+aggregated detection events plus a **best match per person** — for every
+matched person, the frame with the highest similarity seen in the whole
+video is saved to `results/videos/best_matches/`:
+
+| file | content |
+|---|---|
+| `<video>_<person>_frame<N>.jpg` | annotated full frame (box, ID, similarity, frame number) |
+| `<video>_<person>_face.jpg` | face crop at native size (1.5x context margin) |
+| `<video>_<person>_face_2x.jpg` | same crop upscaled 2x with Lanczos, for reports (interpolated, no new detail) |
+
+The annotated result video (`results/videos/<video>_result.mp4`) still shows
+boxes/labels on every sampled frame as before.
+
+
 ## Threshold
 
 The default similarity threshold (0.30) is **not** a universal number — it is

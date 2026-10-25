@@ -7,8 +7,13 @@ Flow (spec section 20):
     -> annotate frame -> write annotated output video
 
 Consecutive detections of the same person are aggregated into detection
-events so the console does not repeat MATCH lines for every sampled frame
-(spec section 21).
+events (spec section 21). Scanning itself is silent (progress bar); for
+every matched person the frame with the highest similarity is kept and
+saved as a snapshot:
+
+    results/videos/best_matches/<video>_<person>_frame<N>.jpg   (annotated full frame)
+    results/videos/best_matches/<video>_<person>_face.jpg       (native-size face crop)
+    results/videos/best_matches/<video>_<person>_face_2x.jpg    (2x Lanczos upscaled crop)
 """
 
 from __future__ import annotations
@@ -18,14 +23,15 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from tqdm import tqdm
 
-from aligner import align_face
 from matcher import match_embedding
-from image_pipeline import GREEN, RED, annotate_face
+from image_pipeline import GREEN, annotate_face
 from detector import FaceDetection
 
 FRAME_SKIP = 5
 AGGREGATION_GAP = 4  # sampled frames a person may be missed before a new event starts
+BEST_MATCH_DIR = Path("results") / "videos" / "best_matches"
 
 
 def iter_sampled_frames(video_path, frame_skip: int = FRAME_SKIP) -> Iterator[tuple[int, np.ndarray]]:
@@ -79,8 +85,16 @@ def run_video_pipeline(video_path, detector, aligner, arcface, reference_databas
 
     open_events: dict[str, dict] = {}      # label -> currently running event
     finished_events: list[dict] = []
+    best_matches: dict[str, dict] = {}     # person_id -> best similarity seen so far
 
-    for frame_number, frame in iter_sampled_frames(video_path, frame_skip):
+    expected_samples = max(frame_count // max(frame_skip, 1), 1) if frame_count else None
+
+    for frame_number, frame in tqdm(
+        iter_sampled_frames(video_path, frame_skip),
+        total=expected_samples,
+        desc="Scanning frames",
+        unit="frame",
+    ):
         seen_labels: set[str] = set()
         annotated = frame.copy()
 
@@ -89,11 +103,11 @@ def run_video_pipeline(video_path, detector, aligner, arcface, reference_databas
             label = result["person_id"] or "unknown"
             seen_labels.add(label)
 
-            state = "MATCH" if result["matched"] else "NO MATCH"
-            print(f"Frame {frame_number}:")
-            print(f"  Face detected (best candidate: {label}, similarity: {result['similarity']:.3f}, {state})")
             open_event(open_events, finished_events, frame_number, label, result["similarity"])
             annotated = annotate_face(annotated, face, result)
+
+            if result["matched"]:
+                _update_best_match(best_matches, result["person_id"], result, face, frame_number, frame)
 
         # Close events for people no longer visible (after a short grace gap).
         for label in list(open_events):
@@ -110,6 +124,8 @@ def run_video_pipeline(video_path, detector, aligner, arcface, reference_databas
     for label in list(open_events):
         close_event(open_events, label, frame_number, finished_events)
     _print_events(finished_events)
+
+    _save_best_matches(best_matches, fps, video_path)
 
     print()
     print(f"Annotated video saved: {annotated_path}")
@@ -178,3 +194,116 @@ def _print_events(events: list[dict]) -> None:
             f" -> average similarity = {average:.3f}"
             f" -> {state}"
         )
+
+
+def _update_best_match(
+    best_matches: dict[str, dict],
+    person_id: str,
+    result: dict,
+    face: FaceDetection,
+    frame_number: int,
+    frame: np.ndarray,
+) -> None:
+    """Keep the frame with the highest similarity seen so far for a person."""
+
+    record = best_matches.get(person_id)
+    if record is None or result["similarity"] > record["similarity"]:
+        best_matches[person_id] = {
+            "similarity": result["similarity"],
+            "frame_number": frame_number,
+            "bbox": face.bbox.copy(),
+            "frame": frame.copy(),
+        }
+
+
+def _extract_face_crop(frame: np.ndarray, bbox: np.ndarray, margin: float = 1.5) -> np.ndarray:
+    """Crop the face region with `margin`x context, clamped to frame bounds."""
+
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = bbox.astype(float)
+    face_w, face_h = x2 - x1, y2 - y1
+
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    half_w, half_h = face_w * margin / 2, face_h * margin / 2
+
+    crop_x1 = max(int(round(cx - half_w)), 0)
+    crop_y1 = max(int(round(cy - half_h)), 0)
+    crop_x2 = min(int(round(cx + half_w)), width)
+    crop_y2 = min(int(round(cy + half_h)), height)
+
+    return frame[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+
+
+def _imwrite(path: Path, image: np.ndarray) -> None:
+    """cv2.imwrite with a fallback for non-ASCII output paths on Windows."""
+
+    try:
+        cv2.imwrite(str(path), image)
+    except cv2.error:
+        ok, encoded = cv2.imencode(".jpg", image)
+        if ok:
+            encoded.tofile(str(path))
+
+
+def _save_best_matches(best_matches: dict[str, dict], fps: float, video_path: Path) -> None:
+    """Save one annotated frame + face crops per matched person and report paths."""
+
+    if not best_matches:
+        return
+
+    BEST_MATCH_DIR.mkdir(parents=True, exist_ok=True)
+    stem = video_path.stem
+
+    print()
+    print("Best match per person:")
+    for person_id in sorted(best_matches):
+        record = best_matches[person_id]
+        similarity = record["similarity"]
+        frame_number = record["frame_number"]
+        seconds = frame_number / fps if fps else 0.0
+
+        frame = record["frame"]
+        annotated = frame.copy()
+        annotated = _annotate_best_match(annotated, record, person_id)
+
+        base = BEST_MATCH_DIR / f"{stem}_{person_id}_frame{frame_number:05d}"
+        _imwrite(base.with_suffix(".jpg"), annotated)
+
+        crop = _extract_face_crop(frame, record["bbox"])
+        if crop.size:
+            _imwrite(BEST_MATCH_DIR / f"{stem}_{person_id}_face.jpg", crop)
+            two_x = cv2.resize(
+                crop,
+                (crop.shape[1] * 2, crop.shape[0] * 2),
+                interpolation=cv2.INTER_LANCZOS4,
+            )
+            _imwrite(BEST_MATCH_DIR / f"{stem}_{person_id}_face_2x.jpg", two_x)
+
+        print(
+            f"  {person_id} -> similarity {similarity:.3f}"
+            f" @ frame {frame_number} ({seconds:.1f}s)"
+        )
+        print(f"    annotated frame   -> {base.with_suffix('.jpg')}")
+        print(f"    face crop (native) -> {BEST_MATCH_DIR / (f'{stem}_{person_id}_face.jpg')}")
+        print(f"    face crop (2x Lanczos) -> {BEST_MATCH_DIR / (f'{stem}_{person_id}_face_2x.jpg')}")
+
+
+def _annotate_best_match(image: np.ndarray, record: dict, person_id: str) -> np.ndarray:
+    """Annotate the saved best-match frame with person, similarity and frame number."""
+
+    x1, y1, x2, y2 = record["bbox"].astype(int)
+    similarity = record["similarity"]
+
+    cv2.rectangle(image, (x1, y1), (x2, y2), GREEN, 2)
+    lines = [
+        person_id,
+        f"similarity: {similarity:.3f}",
+        f"frame: {record['frame_number']}",
+    ]
+    y = y2 + 22 if y2 + 22 * len(lines) < image.shape[0] else y1 - 6
+    for line in lines:
+        ty = max(int(y), 18)
+        cv2.putText(image, line, (x1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(image, line, (x1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.9, GREEN, 2, cv2.LINE_AA)
+        y += 34
+    return image
