@@ -1,0 +1,15 @@
+# Build artifacts
+.venv/
+__pycache__/
+*.pyc
+
+# Large model files
+models/*.onnx
+models/detector/
+*.zip
+
+# Evaluation datasets (large)
+evaluation/
+
+# Runtime results
+results/
